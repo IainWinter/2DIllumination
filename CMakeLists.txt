@@ -11,6 +11,8 @@ add_executable(simplest
     src/main.cpp
     src/gl/glad.c
 
+    src/render.cpp
+
     src/imgui/imgui.cpp
     src/imgui/imgui_demo.cpp
     src/imgui/imgui_draw.cpp

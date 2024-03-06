@@ -1,0 +1,10 @@
+C:\dev\src\simplest\src\main.cpp;C:\dev\src\simplest\build\simplest.dir\Debug\main.obj
+C:\dev\src\simplest\src\gl\glad.c;C:\dev\src\simplest\build\simplest.dir\Debug\glad.obj
+C:\dev\src\simplest\src\render.cpp;C:\dev\src\simplest\build\simplest.dir\Debug\render.obj
+C:\dev\src\simplest\src\imgui\imgui.cpp;C:\dev\src\simplest\build\simplest.dir\Debug\imgui.obj
+C:\dev\src\simplest\src\imgui\imgui_demo.cpp;C:\dev\src\simplest\build\simplest.dir\Debug\imgui_demo.obj
+C:\dev\src\simplest\src\imgui\imgui_draw.cpp;C:\dev\src\simplest\build\simplest.dir\Debug\imgui_draw.obj
+C:\dev\src\simplest\src\imgui\imgui_widgets.cpp;C:\dev\src\simplest\build\simplest.dir\Debug\imgui_widgets.obj
+C:\dev\src\simplest\src\imgui\imgui_impl_sdl2.cpp;C:\dev\src\simplest\build\simplest.dir\Debug\imgui_impl_sdl2.obj
+C:\dev\src\simplest\src\imgui\imgui_impl_opengl3.cpp;C:\dev\src\simplest\build\simplest.dir\Debug\imgui_impl_opengl3.obj
+C:\dev\src\simplest\src\imgui\imgui_tables.cpp;C:\dev\src\simplest\build\simplest.dir\Debug\imgui_tables.obj
