@@ -36,6 +36,7 @@ struct GBufferShader {
     GLuint diffuseTextureLocation;
     GLuint normalTextureLocation;
     GLuint tintLocation;
+    GLuint lightPositionLocation;
 };
 
 struct VoronoiGeneratorSeedShader {
@@ -64,8 +65,10 @@ struct DistanceFieldFromVoronoiShader {
 struct RayMarchShader {
     GLuint handle;
     GLuint inDistanceFieldLocation;
-    GLuint inSceneTextureLocation;
-    GLuint inGlobalEmissiveTextureLocation;
+    GLuint inSceneDiffuseLocation;
+    GLuint inSceneNormalLocation;
+    GLuint inLastEmissiveTextureLocation;
+    GLuint inAccumulatedEmissiveTextureLocation;
 
     GLuint bounceLightEnabledLocation;
     GLuint bounceLightDampeningLocation;
@@ -78,9 +81,13 @@ struct RayMarchShader {
 
     GLuint distanceScaleLocation;
     GLuint emissiveScaleLocation;
+};
 
-    GLuint angleDebugLocation;
-    GLuint offsetDebugLocation;
+struct GaussianBlurShader {
+    GLuint handle;
+    GLuint blurScaleLocation;
+    GLuint textureResolutionLocation;
+    GLuint textureLocation;
 };
 
 struct DrawTextureShader {
@@ -135,6 +142,7 @@ VoronoiGeneratorShader r_voronoiGeneratorShader;
 DistanceFieldFromVoronoiShader r_distanceFieldFromVoronoiShader;
 DrawTextureShader r_drawTextureShader;
 RayMarchShader r_rayMarchShader;
+GaussianBlurShader r_gaussianBlurShader;
 
 GLuint r_gBufferFramebuffer;
 
@@ -144,12 +152,16 @@ GLuint r_voronoiTexture2;
 GLuint r_voronoiFramebuffer2;
 GLuint r_distanceFieldTexture;
 GLuint r_distanceFieldFramebuffer;
-GLuint r_sceneTexture;
-GLuint r_sceneFramebuffer;
+GLuint r_gDiffuseTexture;
+GLuint r_gNormalTexture;
+GLuint r_gDepthTexture;
+GLuint r_accumulationEmissiveTexture;
 GLuint r_globalEmissiveTexture;
 GLuint r_globalEmissiveFramebuffer;
 GLuint r_globalEmissiveTexture2;
 GLuint r_globalEmissiveFramebuffer2;
+GLuint r_emissiveBlurredTexture;
+GLuint r_emissiveBlurredFramebuffer;
 
 Ring<RenderTexturePair> r_globalEmissiveRing;
 
@@ -162,17 +174,16 @@ Clock r_clock;
 
 // random shit
 
-int limitPasses = 10;
-int maxSteps = 2;
+int limitPasses = 11;
+int maxSteps = 12;
 int raysPerPixel = 1;
 float distanceScale = 1.0f;
 float emissiveScale = 1.0f;
-int layerIndex = 3;
-float angleDebug = 0.0;
-vec2 offsetDebug = vec2(1, 1);
-vec4 tint = vec4(1);
+int layerIndex = 4;
 bool bounceLightEnabled = true;
 float bounceLightDampening = 1.f;
+vec3 lightPosition = vec3(0, 0, 1);
+vec2 blurAmount = vec2(0, 0);
 
 std::vector<Sprite> sprites;
 
@@ -203,6 +214,7 @@ const char* spriteVertex = R"(
     out vec2 frag_uv;
     out vec2 frag_screenPosition;
     out vec3 frag_worldPosition;
+    out mat3 frag_normalMatrix;
 
     uniform mat4 u_view;
     uniform mat4 u_proj;
@@ -215,6 +227,7 @@ const char* spriteVertex = R"(
         frag_uv = vert_uv;
         frag_screenPosition = (clipPos.xy / clipPos.w + 1.0) / 2.0;
         frag_worldPosition = worldPos.xyz;
+        frag_normalMatrix = transpose(inverse(mat3(u_model)));
         gl_Position = clipPos;
     }
 )";
@@ -225,9 +238,11 @@ const char* spriteFragment = R"(
     in vec2 frag_uv;
     in vec2 frag_screenPosition;
     in vec3 frag_worldPosition;
+    in mat3 frag_normalMatrix;
 
     layout (location = 0) out vec4 final_color;
-    layout (location = 1) out vec4 final_screenPosition;
+    layout (location = 1) out vec4 final_normal;
+    layout (location = 2) out vec4 final_screenPosition;
 
     uniform sampler2D u_diffuse;
     uniform sampler2D u_normal;
@@ -237,22 +252,29 @@ const char* spriteFragment = R"(
 
     void main() {
         vec4 color = u_tint * texture(u_diffuse, frag_uv);
-        vec3 normal = texture(u_normal, frag_uv).rgb * 2.0 - 1.0;
+        vec3 normalRaw = texture(u_normal, frag_uv).rgb;
 
+        vec3 normal = normalRaw * 2.0 - 1.0;
         normal += vec3(0, 0, 1); // bias to pointing up
-        normal = normalize(normal);
+        normal = normalize(frag_normalMatrix * normal);
 
-        vec3 lightDir = normalize(u_lightPosition - frag_worldPosition);
-        vec3 viewDir = vec3(0, 0, 1);
-        vec3 halfDir = normalize(lightDir + viewDir);
+        // not sure if this is needed cus the texture is storing floats
+        normalRaw = (normal + 1) * 0.5;
 
-        float intensity = max(dot(normal, halfDir), 0.0);
+        // Doesn't work well for flashlight
+
+        //vec3 lightDir = normalize(u_lightPosition - frag_worldPosition);
+        //vec3 viewDir = vec3(0, 0, 1);
+        //vec3 halfDir = normalize(lightDir + viewDir);
+
+        float intensity = 1;//max(dot(normal, halfDir), 0.0);
 
         if (color.a == 0) {
             discard;
         }
 
         final_color = vec4(color.rgb * intensity, color.a);
+        final_normal = vec4(normalRaw, 1);
         final_screenPosition = vec4(frag_screenPosition, 0, 1);
     }
 )";
@@ -323,11 +345,15 @@ const char* rayMarchFragment = R"(
     #version 330 core
 
     in vec2 frag_uv;
-    out vec4 final_color;
+    
+    layout (location = 0) out vec4 final_color;
+    layout (location = 1) out vec4 acc_color;
 
     uniform sampler2D u_inDistanceField;
-    uniform sampler2D u_inSceneTexture;
-    uniform sampler2D u_globalEmissiveTexture;
+    uniform sampler2D u_inGDiffuseTexture;
+    uniform sampler2D u_inGNormalTexture;
+    uniform sampler2D u_lastEmissiveTexture; // last texture should rename
+    uniform sampler2D r_accumulationEmissiveTexture;
 
     uniform ivec2 u_resolution;
     uniform float u_time;
@@ -335,8 +361,6 @@ const char* rayMarchFragment = R"(
     uniform int u_raysPerPixel;
     uniform float u_distanceScale;
     uniform float u_emissiveScale;
-    uniform float u_angleDebug;
-    uniform vec2 u_offsetDebug;
 
     uniform float u_bounceLightEnabled;
     uniform float u_bounceLightDampening;
@@ -393,6 +417,9 @@ const char* rayMarchFragment = R"(
 
         float PI = 3.141596;
 
+        // get the direction of a pixel, aka the normal
+        // if 0, move in all direction
+
         float rand2PI = random(frag_uv * vec2(u_time, -u_time)) * 2.0 * PI;
         float goldenAngle = PI * 0.7639320225; // magic number that gives us a good ray distribution.
 
@@ -406,40 +433,43 @@ const char* rayMarchFragment = R"(
             bool rayHit = rayMarch(origin, dir, rayHitPos, rayDistance);
             if (rayHit) {
                 vec2 delta = 1.0 / vec2(u_resolution);
-                vec4 pixel = texture(u_inSceneTexture, rayHitPos);
+                
+                vec4 hitPixelColorRaw = texture(u_inGDiffuseTexture, rayHitPos);
+                vec4 hitPixelNormalRaw = texture(u_inGNormalTexture, rayHitPos);
 
-                float hitPixelEmissive = max(pixel.r, max(pixel.g, pixel.b)) * u_emissiveScale;
-                vec3 hitPixelColor = pixel.rgb;
+                vec3 normal = hitPixelNormalRaw.rgb * 2.0 - 1.0;
+                vec3 color = hitPixelColorRaw.rgb;
+                float emissive = max(color.r, max(color.g, color.b)) * u_emissiveScale;
 
-                if (u_bounceLightEnabled > 0 && rayDistance > epsilon() && hitPixelEmissive < epsilon()) { 
-                    float lastEmission = 0.0;
-                    vec3 lastColor = vec3(0.0);
+                float lastEmission = 0.0;
+                vec3 lastColor = vec3(0.0);
 
-                    for(int x = -1; x <= 1; x++) {
-                        for(int y = -1; y <= 1; y++) {
-                            vec4 samplePixel = texture(u_globalEmissiveTexture, rayHitPos + delta * vec2(float(x), float(y)));
+                if (u_bounceLightEnabled > 0 && rayDistance > epsilon() && emissive < epsilon()) {
+                    vec4 samplePixel = texture(u_lastEmissiveTexture, rayHitPos);
 
-                            if (samplePixel.a > lastEmission) {
-                                lastEmission = samplePixel.a;
-                                lastColor = samplePixel.rgb;
-                            }
-                        }
+                    if (samplePixel.a > lastEmission) {
+                        lastEmission = samplePixel.a;
+                        lastColor = samplePixel.rgb;
                     }
-
-                    hitPixelEmissive += lastEmission * u_bounceLightDampening / rayDistance;
-                    hitPixelColor += lastColor;
                 }
 
-                pixelEmissive += hitPixelEmissive;
-                pixelColor += hitPixelColor;
+                float pointed = 1;
+                // if (hitPixelNormalRaw.rgb != vec3(0)) { 
+                //     pointed = clamp(dot(normal, vec3(dir, 1)), 0, 1);
+                // }
+
+                pixelEmissive += emissive * pointed + lastEmission * u_bounceLightDampening;
+                pixelColor    += color + lastColor * pointed;
             }
         }
 
-        pixelColor /= pixelEmissive;             // note order
+        pixelColor /= pixelEmissive;
         pixelEmissive /= float(u_raysPerPixel);
 
         vec4 color = vec4(lin_to_srgb(pixelColor * pixelEmissive), pixelEmissive);
+
         final_color = color;
+        acc_color = (color + texture(r_accumulationEmissiveTexture, frag_uv)); // average also decay, should be based on time
     }
 )";
 
@@ -457,7 +487,68 @@ const char* copyTextureFragment = R"(
     }
 )";
 
+const char* gaussianFragment = R"(
+    #version 330 core
+
+    in vec2 frag_uv;
+
+    out vec4 final_color;
+
+    uniform vec2 u_blurScale;
+    uniform vec2 u_textureResolution;
+    uniform sampler2D u_texture;
+
+    uniform float u_scale = 1.94819;
+
+    const int blurRad = 64;
+    const float weight[64] = float[] (0.026597, 0.026538, 0.026361, 0.026070, 0.025668, 0.025159, 0.024552, 0.023853,
+                                      0.023071, 0.022215, 0.021297, 0.020326, 0.019313, 0.018269, 0.017205, 0.016132,
+                                      0.015058, 0.013993, 0.012946, 0.011924, 0.010934, 0.009982, 0.009072, 0.008209,
+                                      0.007395, 0.006632, 0.005921, 0.005263, 0.004658, 0.004104, 0.003599, 0.003143,
+                                      0.002733, 0.002365, 0.002038, 0.001748, 0.001493, 0.001269, 0.001075, 0.000906,
+                                      0.000760, 0.000635, 0.000528, 0.000437, 0.000360, 0.000295, 0.000241, 0.000196,
+                                      0.000159, 0.000128, 0.000103, 0.000082, 0.000065, 0.000052, 0.000041, 0.000032,
+                                      0.000025, 0.000019, 0.000015, 0.000012, 0.000009, 0.000007, 0.000005, 0.000004);
+
+    void main() {
+        vec2 fragSize = 1.0 / u_textureResolution;
+
+        vec4 color = texture(u_texture, frag_uv)  * weight[0] * u_scale;
+
+        for (int i = 1; i < blurRad; i++) {
+            color = color
+                  + texture(u_texture, frag_uv + fragSize * float(i) * u_blurScale) * weight[i] * u_scale;
+                  + texture(u_texture, frag_uv - fragSize * float(i) * u_blurScale) * weight[i] * u_scale;
+        }
+
+        final_color = color;
+    }
+)";
+
 // End Shader code
+
+void printWithLineNumbers(const char* source) {
+    // get total number of newlines
+
+    int totalLineCount = 0;
+    const char* itr = source;
+    while (*itr != '\0') {
+        totalLineCount += 1;
+        itr += 1;
+    }
+
+    int digitCount = (int)log10(totalLineCount) + 1;
+
+    std::istringstream stream(source);
+
+    std::string line;
+    int lineNumber = 0;
+
+    while (std::getline(stream, line)) {
+        printf("%*d| %s\n", digitCount, lineNumber, line.c_str());
+        lineNumber += 1;
+    }
+}
 
 GLuint createShader(const char* vertex, const char* fragment) {
     GLuint shader = glCreateProgram();
@@ -475,7 +566,7 @@ GLuint createShader(const char* vertex, const char* fragment) {
         char* log = (char*)malloc(length);
         glGetShaderInfoLog(vertexShader, length, &length, log);
         printf("Vertex shader error: %s\n", log);
-        printf("Vertex shader source: %s\n", vertex);
+        printWithLineNumbers(vertex);
         free(log);
         throw nullptr;
     }
@@ -491,7 +582,7 @@ GLuint createShader(const char* vertex, const char* fragment) {
         char* log = (char*)malloc(length);
         glGetShaderInfoLog(fragmentShader, length, &length, log);
         printf("Fragment shader error: %s\n", log);
-        printf("Fragment shader source: %s\n", fragment);
+        printWithLineNumbers(fragment);
         free(log);
         throw nullptr;
     }
@@ -534,6 +625,7 @@ void createShaders() {
     r_gBufferShader.diffuseTextureLocation = glGetUniformLocation(r_gBufferShader.handle, "u_diffuse");
     r_gBufferShader.normalTextureLocation = glGetUniformLocation(r_gBufferShader.handle, "u_normal");
     r_gBufferShader.tintLocation = glGetUniformLocation(r_gBufferShader.handle, "u_tint");
+    r_gBufferShader.lightPositionLocation = glGetUniformLocation(r_gBufferShader.handle, "u_lightPosition");
 
     r_voronoiGeneratorShader.handle = createShader(screenQuadVertex, voronoiGeneratorFragment);
     r_voronoiGeneratorShader.inVoronoiLocation = glGetUniformLocation(r_voronoiGeneratorShader.handle, "u_in");
@@ -547,8 +639,10 @@ void createShaders() {
 
     r_rayMarchShader.handle = createShader(screenQuadVertex, rayMarchFragment);
     r_rayMarchShader.inDistanceFieldLocation = glGetUniformLocation(r_rayMarchShader.handle, "u_inDistanceField");
-    r_rayMarchShader.inSceneTextureLocation = glGetUniformLocation(r_rayMarchShader.handle, "u_inSceneTexture");
-    r_rayMarchShader.inGlobalEmissiveTextureLocation = glGetUniformLocation(r_rayMarchShader.handle, "u_globalEmissiveTexture");
+    r_rayMarchShader.inSceneDiffuseLocation = glGetUniformLocation(r_rayMarchShader.handle, "u_inGDiffuseTexture");
+    r_rayMarchShader.inSceneNormalLocation = glGetUniformLocation(r_rayMarchShader.handle, "u_inGNormalTexture");
+    r_rayMarchShader.inLastEmissiveTextureLocation = glGetUniformLocation(r_rayMarchShader.handle, "u_lastEmissiveTexture");
+    r_rayMarchShader.inAccumulatedEmissiveTextureLocation = glGetUniformLocation(r_rayMarchShader.handle, "r_accumulationEmissiveTexture");
     r_rayMarchShader.bounceLightEnabledLocation = glGetUniformLocation(r_rayMarchShader.handle, "u_bounceLightEnabled");
     r_rayMarchShader.bounceLightDampeningLocation = glGetUniformLocation(r_rayMarchShader.handle, "u_bounceLightDampening");
     r_rayMarchShader.resolutionLocation = glGetUniformLocation(r_rayMarchShader.handle, "u_resolution");
@@ -557,11 +651,14 @@ void createShaders() {
     r_rayMarchShader.raysPerPixelLocation = glGetUniformLocation(r_rayMarchShader.handle, "u_raysPerPixel");
     r_rayMarchShader.distanceScaleLocation = glGetUniformLocation(r_rayMarchShader.handle, "u_distanceScale");
     r_rayMarchShader.emissiveScaleLocation = glGetUniformLocation(r_rayMarchShader.handle, "u_emissiveScale");
-    r_rayMarchShader.angleDebugLocation = glGetUniformLocation(r_rayMarchShader.handle, "u_angleDebug");
-    r_rayMarchShader.offsetDebugLocation = glGetUniformLocation(r_rayMarchShader.handle, "u_offsetDebug");
 
     r_drawTextureShader.handle = createShader(screenQuadVertex, copyTextureFragment);
     r_drawTextureShader.textureLocation = glGetUniformLocation(r_drawTextureShader.handle, "u_texture");
+
+    r_gaussianBlurShader.handle = createShader(screenQuadVertex, gaussianFragment);
+    r_gaussianBlurShader.blurScaleLocation = glGetUniformLocation(r_gaussianBlurShader.handle, "u_blurScale");
+    r_gaussianBlurShader.textureResolutionLocation = glGetUniformLocation(r_gaussianBlurShader.handle, "u_textureResolution");
+    r_gaussianBlurShader.textureLocation = glGetUniformLocation(r_gaussianBlurShader.handle, "u_texture");
 }
 
 void createTextures() {
@@ -601,17 +698,44 @@ void createTextures() {
     glBindFramebuffer(GL_FRAMEBUFFER, r_distanceFieldFramebuffer);
     glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, r_distanceFieldTexture, 0);
 
-    glGenTextures(1, &r_sceneTexture);
-    glBindTexture(GL_TEXTURE_2D, r_sceneTexture);
+    glGenTextures(1, &r_gDiffuseTexture);
+    glBindTexture(GL_TEXTURE_2D, r_gDiffuseTexture);
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, r_rayMarchWidth, r_rayMarchWidth, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
 
-    glGenFramebuffers(1, &r_sceneFramebuffer);
-    glBindFramebuffer(GL_FRAMEBUFFER, r_sceneFramebuffer);
-    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, r_sceneTexture, 0);
+    glGenTextures(1, &r_gNormalTexture);
+    glBindTexture(GL_TEXTURE_2D, r_gNormalTexture);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, r_rayMarchWidth, r_rayMarchWidth, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+
+    glGenTextures(1, &r_gDepthTexture);
+    glBindTexture(GL_TEXTURE_2D, r_gDepthTexture);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_DEPTH_COMPONENT, r_rayMarchWidth, r_rayMarchWidth, 0, GL_DEPTH_COMPONENT, GL_FLOAT, NULL);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+
+    glGenFramebuffers(1, &r_gBufferFramebuffer);
+    glBindFramebuffer(GL_FRAMEBUFFER, r_gBufferFramebuffer);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, r_gDiffuseTexture, 0);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT1, GL_TEXTURE_2D, r_gNormalTexture, 0);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT2, GL_TEXTURE_2D, r_voronoiTexture, 0);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_TEXTURE_2D, r_gDepthTexture, 0);
+
+    glGenTextures(1, &r_accumulationEmissiveTexture);
+    glBindTexture(GL_TEXTURE_2D, r_accumulationEmissiveTexture);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, r_rayMarchWidth, r_rayMarchWidth, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_BORDER);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_BORDER);
 
     glGenTextures(1, &r_globalEmissiveTexture);
     glBindTexture(GL_TEXTURE_2D, r_globalEmissiveTexture);
@@ -624,6 +748,7 @@ void createTextures() {
     glGenFramebuffers(1, &r_globalEmissiveFramebuffer);
     glBindFramebuffer(GL_FRAMEBUFFER, r_globalEmissiveFramebuffer);
     glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, r_globalEmissiveTexture, 0);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT1, GL_TEXTURE_2D, r_accumulationEmissiveTexture, 0);
 
     glGenTextures(1, &r_globalEmissiveTexture2);
     glBindTexture(GL_TEXTURE_2D, r_globalEmissiveTexture2);
@@ -636,19 +761,24 @@ void createTextures() {
     glGenFramebuffers(1, &r_globalEmissiveFramebuffer2);
     glBindFramebuffer(GL_FRAMEBUFFER, r_globalEmissiveFramebuffer2);
     glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, r_globalEmissiveTexture2, 0);
-
-    glGenFramebuffers(1, &r_gBufferFramebuffer);
-    glBindFramebuffer(GL_FRAMEBUFFER, r_gBufferFramebuffer);
-    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, r_sceneTexture, 0);
-    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT1, GL_TEXTURE_2D, r_voronoiTexture, 0);
-
-    GLuint attachments[2] = { GL_COLOR_ATTACHMENT0, GL_COLOR_ATTACHMENT1 };
-    glDrawBuffers(2, attachments);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT1, GL_TEXTURE_2D, r_accumulationEmissiveTexture, 0);
 
     r_globalEmissiveRing = Ring<RenderTexturePair>({
         { r_globalEmissiveFramebuffer, r_globalEmissiveTexture },
         { r_globalEmissiveFramebuffer2, r_globalEmissiveTexture2 },
     });
+
+    glGenTextures(1, &r_emissiveBlurredTexture);
+    glBindTexture(GL_TEXTURE_2D, r_emissiveBlurredTexture);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, r_rayMarchWidth, r_rayMarchWidth, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_BORDER);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_BORDER);
+
+    glGenFramebuffers(1, &r_emissiveBlurredFramebuffer);
+    glBindFramebuffer(GL_FRAMEBUFFER, r_emissiveBlurredFramebuffer);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, r_emissiveBlurredTexture, 0);
 }
 
 void createGeometryBuffers() {
@@ -698,8 +828,8 @@ void createGeometryBuffers() {
 }
 
 void renderCreate(int width, int height) {
-    r_rayMarchWidth = width;
-    r_rayMarchHeight = height;
+    r_rayMarchWidth = width / 3;
+    r_rayMarchHeight = height / 3;
     r_screenWidth = width;
     r_screenHeight = height;
     r_aspect = (float)width / (float)height;
@@ -729,14 +859,6 @@ void renderCreate(int width, int height) {
     createShaders();
     createTextures();
     createGeometryBuffers();
-
-    Sprite sprite;
-    sprite.position = vec2(0, 0);
-    sprite.velocity = vec2(0, 0);
-    sprite.size = vec2(0.5, 0.5);
-    sprite.color = vec4(1, 1, 1, 1);
-
-    sprites.push_back(sprite);
 }
 
 void renderDestroy() {
@@ -765,13 +887,23 @@ void render() {
     // Render the G buffer
     //
 
-    glViewport(0, 0, r_screenWidth, r_screenHeight);
+    glViewport(0, 0, r_rayMarchWidth, r_rayMarchHeight);
 
-    glUseProgram(r_gBufferShader.handle);
     glBindFramebuffer(GL_FRAMEBUFFER, r_gBufferFramebuffer);
-    glClear(GL_COLOR_BUFFER_BIT);
+    {
+        GLuint attachments[3] = { GL_COLOR_ATTACHMENT0, GL_COLOR_ATTACHMENT1, GL_COLOR_ATTACHMENT2 };
+        glDrawBuffers(3, attachments);
+    }
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+
+    glEnable(GL_DEPTH_TEST);
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_ONE, GL_ONE);
+    
+    glUseProgram(r_gBufferShader.handle);
     glUniformMatrix4fv(r_gBufferShader.viewLocation, 1, GL_FALSE, &r_view[0][0]);
     glUniformMatrix4fv(r_gBufferShader.projLocation, 1, GL_FALSE, &r_projection[0][0]);
+    glUniform3fv(r_gBufferShader.lightPositionLocation, 1, &lightPosition[0]);
     glBindVertexArray(r_spriteInstanceMesh.vertexArray);
 
     GLuint lastDiffuse = 0;
@@ -781,10 +913,9 @@ void render() {
         mat4 model = mat4(1.f);
         model = glm::translate(model, vec3(sprite.position.x, sprite.position.y, 0.0f));
         model = glm::scale(model, vec3(sprite.size.x, sprite.size.y, 1.0f));
+        model = glm::rotate(model, sprite.rotation, vec3(0, 0, 1));
 
-        vec4 t = sprite.color * tint;
-
-        glUniform4fv(r_gBufferShader.tintLocation, 1, &t[0]);
+        glUniform4fv(r_gBufferShader.tintLocation, 1, &sprite.color[0]);
         glUniformMatrix4fv(r_gBufferShader.modelLocation, 1, GL_FALSE, &model[0][0]);
 
         if (sprite.diffuse != lastDiffuse) {
@@ -811,6 +942,9 @@ void render() {
 
     // 1. Generate a voronoi texture from the screen positions
 
+    glDisable(GL_BLEND);
+    glDisable(GL_DEPTH_TEST);
+
     glBindVertexArray(r_screenQuadMesh.vertexArray);
     
     glUseProgram(r_voronoiGeneratorShader.handle);
@@ -823,14 +957,15 @@ void render() {
         { r_voronoiFramebuffer2, r_voronoiTexture2 },
     });
 
-    // int bufferIndex = 0;
-    // GLuint framebuffers[2] = { r_voronoiFramebuffer, r_voronoiFramebuffer2 };
-    // GLuint textures[2] = { r_voronoiTexture, r_voronoiTexture2 };
-    // GLuint finalVoronoi = textures[0]; // can calculate
+    {
+        GLuint attachments[1] = { GL_COLOR_ATTACHMENT0 };
+        glDrawBuffers(1, attachments);
+    }
+
+    glActiveTexture(GL_TEXTURE0);
     for (int i = 0; i < min(passes, max(limitPasses, 0)); i++) {
         int offset = (int)pow(2, passes - i - 1);
         glBindFramebuffer(GL_FRAMEBUFFER, voronoiRing.nextValue().framebuffer);
-        glActiveTexture(GL_TEXTURE0);
         glBindTexture(GL_TEXTURE_2D, voronoiRing.currentValue().texture);
         glUniform1i(r_voronoiGeneratorShader.inVoronoiLocation, 0);
         glUniform1i(r_voronoiGeneratorShader.offsetLocation, offset);
@@ -845,7 +980,7 @@ void render() {
 
     glUseProgram(r_distanceFieldFromVoronoiShader.handle);
     glBindFramebuffer(GL_FRAMEBUFFER, r_distanceFieldFramebuffer);
-    glActiveTexture(GL_TEXTURE0);
+    //glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, finalVoronoi);
     glUniform1i(r_distanceFieldFromVoronoiShader.inVoronoiLocation, 0);
     glUniform1f(r_distanceFieldFromVoronoiShader.distanceScaleLocation, distanceScale);
@@ -857,23 +992,38 @@ void render() {
 
     glUseProgram(r_rayMarchShader.handle);
     glBindFramebuffer(GL_FRAMEBUFFER, r_globalEmissiveRing.currentValue().framebuffer);
-    glActiveTexture(GL_TEXTURE0);
+
+    {
+        GLuint attachments[2] = { GL_COLOR_ATTACHMENT0, GL_COLOR_ATTACHMENT1 };
+        glDrawBuffers(2, attachments);
+    }
+
+    //glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, r_distanceFieldTexture);
     glUniform1i(r_rayMarchShader.inDistanceFieldLocation, 0);
+
     glActiveTexture(GL_TEXTURE1);
-    glBindTexture(GL_TEXTURE_2D, r_sceneTexture);
-    glUniform1i(r_rayMarchShader.inSceneTextureLocation, 1);
+    glBindTexture(GL_TEXTURE_2D, r_gDiffuseTexture);
+    glUniform1i(r_rayMarchShader.inSceneDiffuseLocation, 1);
+
     glActiveTexture(GL_TEXTURE2);
+    glBindTexture(GL_TEXTURE_2D, r_gNormalTexture);
+    glUniform1i(r_rayMarchShader.inSceneNormalLocation, 2);
+
+    glActiveTexture(GL_TEXTURE3);
     glBindTexture(GL_TEXTURE_2D, r_globalEmissiveRing.nextValue().texture);
-    glUniform1i(r_rayMarchShader.inGlobalEmissiveTextureLocation, 2);
+    glUniform1i(r_rayMarchShader.inLastEmissiveTextureLocation, 3);
+
+    glActiveTexture(GL_TEXTURE4);
+    glBindTexture(GL_TEXTURE_2D, r_accumulationEmissiveTexture);
+    glUniform1i(r_rayMarchShader.inAccumulatedEmissiveTextureLocation, 4);
+
     glUniform2i(r_rayMarchShader.resolutionLocation, r_rayMarchWidth, r_rayMarchHeight);
     glUniform1f(r_rayMarchShader.timeLocation, r_clock.totalTime);
     glUniform1i(r_rayMarchShader.maxStepsLocation, maxSteps);
     glUniform1i(r_rayMarchShader.raysPerPixelLocation, raysPerPixel);
     glUniform1f(r_rayMarchShader.distanceScaleLocation, distanceScale);
     glUniform1f(r_rayMarchShader.emissiveScaleLocation, emissiveScale);
-    glUniform1f(r_rayMarchShader.angleDebugLocation, angleDebug);
-    glUniform2f(r_rayMarchShader.offsetDebugLocation, offsetDebug.x, offsetDebug.y);
     glUniform1f(r_rayMarchShader.bounceLightEnabledLocation, bounceLightEnabled);
     glUniform1f(r_rayMarchShader.bounceLightDampeningLocation, clamp(1.f - r_clock.deltaTime *  bounceLightDampening, 0.f, 1.f));
     glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_INT, 0);
@@ -881,23 +1031,52 @@ void render() {
 
     r_globalEmissiveRing.next();
 
+    // 4. Blur the global emissive texture
+
+    glUseProgram(r_gaussianBlurShader.handle);
+    glBindFramebuffer(GL_FRAMEBUFFER, r_emissiveBlurredFramebuffer);
+    glUniform2f(r_gaussianBlurShader.textureResolutionLocation, (float)r_rayMarchWidth, (float)r_rayMarchHeight);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, r_accumulationEmissiveTexture);
+    glUniform1i(r_gaussianBlurShader.textureLocation, 0);
+    glUniform2f(r_gaussianBlurShader.blurScaleLocation, blurAmount.x, 0);
+    glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_INT, 0);
+    glTextureBarrier();
+    glBindTexture(GL_TEXTURE_2D, r_emissiveBlurredTexture);
+    glUniform1i(r_gaussianBlurShader.textureLocation, 0);
+    glUniform2f(r_gaussianBlurShader.blurScaleLocation, 0, blurAmount.y);
+    glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_INT, 0);
+    glTextureBarrier();
+
     //
     // Composite (right now this is debug)
     //
 
+    glViewport(0, 0, r_screenWidth, r_screenHeight);
+
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
     glClear(GL_COLOR_BUFFER_BIT);
     glUseProgram(r_drawTextureShader.handle);
-    GLuint layers[4] = {
-        r_sceneTexture,
+    GLuint layers[7] = {
+        r_gDiffuseTexture,
+        r_gNormalTexture,
         finalVoronoi,
         r_distanceFieldTexture,
-        r_globalEmissiveTexture
+        r_globalEmissiveTexture,
+        r_accumulationEmissiveTexture,
+        r_emissiveBlurredTexture
     };
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, layers[layerIndex]);
+
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+
     glUniform1i(r_drawTextureShader.textureLocation, 0);
     glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_INT, 0);
+
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
 
     ImGui_ImplOpenGL3_NewFrame();
     ImGui_ImplSDL2_NewFrame();
@@ -908,14 +1087,12 @@ void render() {
         ImGui::SliderInt("Rays per pixel", &raysPerPixel, 1, 100);
         ImGui::SliderFloat("Distance scale", &distanceScale, 0.1f, 10.0f);
         ImGui::SliderFloat("Emissive scale", &emissiveScale, 0.1f, 10.0f);
-        ImGui::SliderInt("Draw layer", &layerIndex, 0, 3);
+        ImGui::SliderInt("Draw layer", &layerIndex, 0, sizeof(layers) / sizeof(GLuint) - 1);
         ImGui::SliderInt("Limit passes", &limitPasses, 0, passes);
-        ImGui::SliderFloat("Angle debug", &angleDebug, 0.0f, 6.28f);
-        ImGui::SliderFloat2("Offset debug", &offsetDebug.x, -2.0f, 2.0f);
-        ImGui::SliderFloat4("Tint", &tint.x, 0.0f, 1.0f);
         ImGui::Checkbox("Use Bounce Light", &bounceLightEnabled);        
-        ImGui::SliderFloat("Bounce light dampening", &bounceLightDampening, 0.f, 1.f);
-
+        ImGui::SliderFloat("Bounce light dampening", &bounceLightDampening, 0.f, 1000.f);
+        ImGui::SliderFloat3("Light Position", &lightPosition.x, -5.0f, 5.0f);
+        ImGui::SliderFloat2("Blur Amount", &blurAmount.x, 0.0f, 1.0f);
     }
     ImGui::End();
     
@@ -976,6 +1153,16 @@ void pollEvents(InputState* pInput) {
                 pInput->mouseWheel += event.wheel.y / 10.f;
                 break;
             }
+
+            case SDL_KEYDOWN: {
+                pInput->keysDown[event.key.keysym.scancode] = 1.f;
+                break;
+            }
+
+            case SDL_KEYUP: {
+                pInput->keysDown[event.key.keysym.scancode] = 0.f;
+                break;
+            }
         }
     }
 }
@@ -1023,7 +1210,7 @@ void errorCallback(GLenum source, GLenum type, GLuint id, GLenum severity, GLsiz
 
     printf("  Message: %s\n", message);
 
-    throw nullptr;
+    // throw nullptr;
 }
 
 void addSprite(const Sprite& sprite) {

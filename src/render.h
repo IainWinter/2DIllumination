@@ -14,6 +14,8 @@ struct InputState {
     float mouseWheel;
     bool isMousePressed;
     bool isMousePressedLast;
+
+    float keysDown[512];
 };
 
 struct RenderCreateInfo {
@@ -22,12 +24,15 @@ struct RenderCreateInfo {
 
 struct Sprite {
     vec2 position;
-    vec2 velocity;
+    float rotation;
     vec2 size;
     vec4 color;
 
     GLuint diffuse;
     GLuint normal;
+
+    vec2 velocity;
+    float life;
 };
 
 GLuint createTextureFromFile(const char* filename);
